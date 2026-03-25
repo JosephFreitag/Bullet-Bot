@@ -7,8 +7,11 @@ import queue
 import sys
 import threading
 from app.genai_service import GenAIService
-from app.database import DatabaseService
+from app.database import DatabaseService, utc_date_string
 from flet import Clipboard
+
+DAILY_TOKEN_LIMIT = 1_000_000
+TOKEN_USAGE_POLL_SECONDS = 15
 
 # Resolve paths from the directory that contains main.py (stable when cwd differs, e.g. IDE run).
 _APP_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -73,18 +76,61 @@ async def main(page: ft.Page):
         on_click=None # We will attach this later
     )
 
+    token_usage_text = ft.Text(
+        "",
+        size=12,
+        color="#9e9e9e",
+        tooltip="Shared total for all users on this app (UTC day). Resets at midnight UTC.",
+    )
+
     # 2. Update the AppBar to use that specific variable
     page.appbar = ft.AppBar(
         title=ft.Text("Bullet Bot Login"),
         center_title=True,
         bgcolor="#2d2d2d",
         automatically_imply_leading=False,
-        actions=[logout_button]
+        actions=[token_usage_text, logout_button]
     )
 
         # --- 2. Application State Management ---
     current_conversation_id = None
     logged_in_user = None
+    token_usage_poll_task: asyncio.Task | None = None
+
+    def refresh_token_usage_display():
+        u = db_service.get_token_usage_for_date()
+        total = u["total_tokens"]
+        token_usage_text.value = (
+            f"Tokens today (all users, UTC): {total:,} / {DAILY_TOKEN_LIMIT:,}"
+        )
+        if total >= DAILY_TOKEN_LIMIT:
+            token_usage_text.color = "#e57373"
+        elif total >= int(DAILY_TOKEN_LIMIT * 0.9):
+            token_usage_text.color = "#ffb74d"
+        else:
+            token_usage_text.color = "#9e9e9e"
+
+    def start_token_usage_polling():
+        nonlocal token_usage_poll_task
+
+        async def poll_loop():
+            try:
+                while logged_in_user is not None:
+                    refresh_token_usage_display()
+                    page.update()
+                    await asyncio.sleep(TOKEN_USAGE_POLL_SECONDS)
+            except asyncio.CancelledError:
+                return
+
+        if token_usage_poll_task and not token_usage_poll_task.done():
+            return
+        token_usage_poll_task = asyncio.create_task(poll_loop())
+
+    def stop_token_usage_polling():
+        nonlocal token_usage_poll_task
+        if token_usage_poll_task and not token_usage_poll_task.done():
+            token_usage_poll_task.cancel()
+        token_usage_poll_task = None
 
     # --- 3. UI Control Definitions (Moved placeholders here) ---
     # We define the controls first, then define functions, 
@@ -319,6 +365,8 @@ async def main(page: ft.Page):
             settings_button.visible = True
             settings_button_stack.visible = True
             sync_fine_tune_badge()
+            refresh_token_usage_display()
+            start_token_usage_polling()
             
             page.appbar.title = ft.Text(f"Bullet Bot Ghost Writing For {user['username']}")
             await load_history_list()
@@ -368,6 +416,8 @@ async def main(page: ft.Page):
         logged_in_user = None
         current_conversation_id = None
         persist_logged_in_user_id(None)
+        stop_token_usage_polling()
+        refresh_token_usage_display()
         
         # --- DETACH DRAWER TO HIDE HAMBURGER ---
         page.end_drawer = None 
@@ -470,6 +520,20 @@ async def main(page: ft.Page):
         if not logged_in_user or not user_input:
             return
 
+        usage_pre = db_service.get_token_usage_for_date()
+        if usage_pre["total_tokens"] >= DAILY_TOKEN_LIMIT:
+            page.snack_bar = ft.SnackBar(
+                content=ft.Text(
+                    f"Daily token limit reached ({DAILY_TOKEN_LIMIT:,} tokens UTC day). "
+                    f"Try again after midnight UTC."
+                ),
+                bgcolor="#c62828",
+                duration=5000,
+            )
+            page.snack_bar.open = True
+            page.update()
+            return
+
         # --- UI State: Disable inputs while processing ---
         input_field.disabled = True
         send_button.disabled = True
@@ -500,6 +564,8 @@ async def main(page: ft.Page):
 
         prior_history = db_service.get_messages(current_conversation_id)
 
+        stream_usage: list[dict] = []
+
         stream_md = ft.Markdown(
             "",
             selectable=True,
@@ -525,7 +591,9 @@ async def main(page: ft.Page):
 
         def run_stream():
             try:
-                for fragment in genai_service.stream_ai_response(user_input, prior_history):
+                for fragment in genai_service.stream_ai_response(
+                    user_input, prior_history, usage_out=stream_usage
+                ):
                     chunk_queue.put(("delta", fragment))
             except Exception as ex:
                 chunk_queue.put(("error", str(ex)))
@@ -563,6 +631,17 @@ async def main(page: ft.Page):
             bot_response = "(No response)"
         db_service.add_message(current_conversation_id, "user", user_input)
         db_service.add_message(current_conversation_id, "assistant", bot_response)
+
+        if stream_usage:
+            u = stream_usage[0]
+            db_service.add_token_usage(
+                u["total_tokens"], u["prompt_tokens"], u["completion_tokens"]
+            )
+        else:
+            est_in = genai_service.estimate_prompt_tokens(user_input, prior_history)
+            est_out = max(1, len(bot_response) // 4)
+            db_service.add_token_usage(est_in + est_out, est_in, est_out)
+        refresh_token_usage_display()
 
         chat_display.controls.remove(streaming_row)
         chat_display.controls.append(create_bot_response_view(page, bot_response))
@@ -765,6 +844,7 @@ async def main(page: ft.Page):
     )
 
     page.add(main_layout)
+    refresh_token_usage_display()
 
     async def try_restore_session():
         nonlocal logged_in_user
@@ -777,11 +857,13 @@ async def main(page: ft.Page):
 
         uid = prefs.get("user_id")
         if uid is None:
+            refresh_token_usage_display()
             page.update()
             return
         try:
             uid = int(uid)
         except (TypeError, ValueError):
+            refresh_token_usage_display()
             page.update()
             return
 
@@ -790,6 +872,7 @@ async def main(page: ft.Page):
             p = load_prefs()
             p.pop("user_id", None)
             save_prefs(p)
+            refresh_token_usage_display()
             page.update()
             return
 
@@ -801,6 +884,8 @@ async def main(page: ft.Page):
         settings_button_stack.visible = True
         sync_fine_tune_badge()
         page.appbar.title = ft.Text(f"Bullet Bot Ghost Writing For {user['username']}")
+        refresh_token_usage_display()
+        start_token_usage_polling()
         await load_history_list()
         await START_new_chat(None)
         page.update()

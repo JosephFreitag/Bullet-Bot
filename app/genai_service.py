@@ -144,6 +144,26 @@ class GenAIService:
         messages.append({"role": "user", "content": final_user_content})
         return messages
 
+    def estimate_prompt_tokens(self, user_input, history=None) -> int:
+        """Rough token count for billing fallback (~4 chars per token)."""
+        messages = self._build_chat_messages(user_input, history)
+        chars = sum(len(m.get("content") or "") for m in messages)
+        return max(1, chars // 4)
+
+    @staticmethod
+    def _usage_dict_from_api(usage_obj) -> dict | None:
+        if usage_obj is None:
+            return None
+        total = getattr(usage_obj, "total_tokens", None)
+        prompt = getattr(usage_obj, "prompt_tokens", None)
+        completion = getattr(usage_obj, "completion_tokens", None)
+        if total is None and prompt is None and completion is None:
+            return None
+        pt = int(prompt or 0)
+        ct = int(completion or 0)
+        tot = int(total) if total is not None else pt + ct
+        return {"total_tokens": tot, "prompt_tokens": pt, "completion_tokens": ct}
+
     def get_ai_response(self, user_input, history=None):
         messages = self._build_chat_messages(user_input, history)
         try:
@@ -151,21 +171,36 @@ class GenAIService:
                 model=self.model,
                 messages=messages,
             )
-            return response.choices[0].message.content
+            return response.choices[0].message.content, self._usage_dict_from_api(
+                getattr(response, "usage", None)
+            )
         except Exception as e:
             print(f"\nAPI Error: {e}")
-            return f"Sorry, I encountered an error: {e}"
+            return f"Sorry, I encountered an error: {e}", None
 
-    def stream_ai_response(self, user_input, history=None):
-        """Yields text fragments from the model (OpenAI-compatible streaming)."""
+    def stream_ai_response(self, user_input, history=None, usage_out: list | None = None):
+        """Yields text fragments; optional usage_out list receives one usage dict if the API reports it."""
         messages = self._build_chat_messages(user_input, history)
+        last_usage = None
         try:
-            stream = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                stream=True,
-            )
+            try:
+                stream = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    stream=True,
+                    stream_options={"include_usage": True},
+                )
+            except Exception:
+                stream = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    stream=True,
+                )
             for chunk in stream:
+                u = getattr(chunk, "usage", None)
+                parsed = self._usage_dict_from_api(u)
+                if parsed:
+                    last_usage = parsed
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
@@ -174,3 +209,6 @@ class GenAIService:
         except Exception as e:
             print(f"\nAPI Error: {e}")
             yield f"Sorry, I encountered an error: {e}"
+        finally:
+            if usage_out is not None and last_usage is not None:
+                usage_out.append(last_usage)

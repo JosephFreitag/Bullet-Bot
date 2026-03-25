@@ -1,6 +1,13 @@
 import sqlite3
 import bcrypt
 import os
+from datetime import datetime, timezone
+
+
+def utc_date_string() -> str:
+    """Calendar day key for shared daily limits (UTC)."""
+    return datetime.now(timezone.utc).date().isoformat()
+
 
 class DatabaseService:
     # 1. Add db_path as a keyword argument
@@ -40,6 +47,15 @@ class DatabaseService:
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 FOREIGN KEY (conversation_id) REFERENCES conversations (id)
+            );
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS token_usage_daily (
+                usage_date TEXT NOT NULL PRIMARY KEY,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
         self.conn.commit()
@@ -116,6 +132,58 @@ class DatabaseService:
 
     def close(self):
         self.conn.close()
+
+    def get_token_usage_for_date(self, usage_date: str | None = None) -> dict:
+        """Totals for one calendar day (default: today UTC)."""
+        day = usage_date or utc_date_string()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT total_tokens, prompt_tokens, completion_tokens
+            FROM token_usage_daily WHERE usage_date = ?
+            """,
+            (day,),
+        )
+        row = cursor.fetchone()
+        if row:
+            return {
+                "usage_date": day,
+                "total_tokens": int(row[0]),
+                "prompt_tokens": int(row[1]),
+                "completion_tokens": int(row[2]),
+            }
+        return {
+            "usage_date": day,
+            "total_tokens": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
+
+    def add_token_usage(
+        self,
+        total_tokens: int,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        usage_date: str | None = None,
+    ):
+        """Increment shared daily counters (all users, same DB file)."""
+        if total_tokens <= 0 and prompt_tokens <= 0 and completion_tokens <= 0:
+            return
+        day = usage_date or utc_date_string()
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO token_usage_daily (usage_date, total_tokens, prompt_tokens, completion_tokens)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(usage_date) DO UPDATE SET
+                total_tokens = token_usage_daily.total_tokens + excluded.total_tokens,
+                prompt_tokens = token_usage_daily.prompt_tokens + excluded.prompt_tokens,
+                completion_tokens = token_usage_daily.completion_tokens + excluded.completion_tokens,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (day, total_tokens, prompt_tokens, completion_tokens),
+        )
+        self.conn.commit()
 
     def delete_conversation(self, conversation_id):
         """Deletes a conversation and all its associated messages."""
