@@ -24,8 +24,9 @@ class GenAIService:
         
         self.context_files = {}
         self.system_prompt = ""
-        self.supplemental_context = "" 
-        
+        self.supplemental_context = ""
+        self._active_context_name: str | None = None
+
         self.refresh_context_list()
 
     @staticmethod
@@ -58,14 +59,21 @@ class GenAIService:
         if not os.path.exists(self.context_path):
             print(f"Warning: Context path {self.context_path} does not exist.")
             self.system_prompt = "You are a helpful assistant."
+            self._active_context_name = None
             return
-            
-        for file in os.listdir(self.context_path):
-            if file.lower().endswith(_CONTEXT_EXTENSIONS):
-                display_name = Path(file).stem
-                # Map the name to the FULL path of the file
-                self.context_files[display_name] = os.path.join(self.context_path, file)
-        
+
+        found = sorted(
+            f for f in os.listdir(self.context_path) if f.lower().endswith(_CONTEXT_EXTENSIONS)
+        )
+        for file in found:
+            display_name = Path(file).stem
+            self.context_files[display_name] = os.path.join(self.context_path, file)
+
+        print(
+            f"Context: using folder {self.context_path!r} "
+            f"({len(self.context_files)} file(s): {', '.join(self.context_files.keys()) or 'none'})"
+        )
+
         # Default startup prompt logic
         if "EPB" in self.context_files:
             self.set_system_prompt("EPB")
@@ -73,36 +81,92 @@ class GenAIService:
             self.set_system_prompt(list(self.context_files.keys())[0])
         else:
             self.system_prompt = "You are a helpful assistant."
+            self._active_context_name = None
+
+    @staticmethod
+    def _read_context_file(filepath: str) -> str:
+        with open(filepath, "r", encoding="utf-8") as f:
+            text = f.read()
+        if text.startswith("\ufeff"):
+            text = text.lstrip("\ufeff")
+        return text
 
     def set_system_prompt(self, context_name: str | None):
         """Loads the base system prompt from the selected file."""
         if not context_name:
             self.system_prompt = "You are a helpful assistant."
+            self._active_context_name = None
             return
         filepath = self.context_files.get(context_name)
         if filepath and os.path.exists(filepath):
             try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    self.system_prompt = f.read()
+                self.system_prompt = self._read_context_file(filepath)
+                self._active_context_name = context_name
+                preview = self.system_prompt[:120].replace("\n", " ")
+                print(
+                    f"Loaded context {context_name!r} ({len(self.system_prompt)} chars) "
+                    f"from {filepath!r} preview: {preview!r}..."
+                )
             except Exception as e:
                 print(f"Error reading context file: {e}")
                 self.system_prompt = "You are a helpful assistant."
+                self._active_context_name = None
         else:
             print(f"Warning: Context {context_name} not found. Using default.")
             self.system_prompt = "You are a helpful assistant."
+            self._active_context_name = None
+
+    def _reload_active_context_from_disk(self):
+        """Re-read the selected context file so edits apply without restarting."""
+        if not self._active_context_name:
+            return
+        filepath = self.context_files.get(self._active_context_name)
+        if filepath and os.path.exists(filepath):
+            try:
+                self.system_prompt = self._read_context_file(filepath)
+            except Exception as e:
+                print(f"Error re-reading context file: {e}")
+
+    def _model_ignores_openai_system_role(self) -> bool:
+        """Gemini OpenAI-compatible endpoints sometimes do not apply role=system reliably."""
+        return "gemini" in (self.model or "").lower()
 
     def get_ai_response(self, user_input, history=None):
         if history is None:
             history = []
-            
-        # --- Combine base prompt with supplemental rules from the drawer ---
-        full_system_instructions = self.system_prompt
-        if self.supplemental_context.strip():
-            full_system_instructions += f"\n\nADDITIONAL USER RULES/CONTEXT:\n{self.supplemental_context}"
 
-        messages = [{"role": "system", "content": full_system_instructions}]
-        messages.extend(history)
-        messages.append({"role": "user", "content": user_input})
+        self._reload_active_context_from_disk()
+
+        # --- Combine base prompt with supplemental rules from the drawer ---
+        full_system_instructions = (self.system_prompt or "").strip()
+        if not full_system_instructions:
+            full_system_instructions = "You are a helpful assistant."
+        if self.supplemental_context.strip():
+            full_system_instructions += (
+                f"\n\nADDITIONAL USER RULES/CONTEXT:\n{self.supplemental_context.strip()}"
+            )
+
+        if self._model_ignores_openai_system_role():
+            # Gemini OpenAI-compatible APIs often under-apply role=system; prime the thread instead.
+            messages = [
+                {
+                    "role": "user",
+                    "content": (
+                        "## Instructions (apply to the entire conversation below)\n\n"
+                        f"{full_system_instructions}"
+                    ),
+                },
+                {
+                    "role": "assistant",
+                    "content": "Understood. I will follow these instructions for all following messages.",
+                },
+            ]
+            messages.extend(history)
+            messages.append({"role": "user", "content": user_input})
+        else:
+            messages = [{"role": "system", "content": full_system_instructions}]
+            messages.extend(history)
+            messages.append({"role": "user", "content": user_input})
         
         try:
             response = self.client.chat.completions.create(
