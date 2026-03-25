@@ -7,13 +7,13 @@ from app.genai_service import GenAIService
 from app.database import DatabaseService
 from flet import Clipboard
 
-# For the database, we usually want it to stay NEXT to the EXE, 
-# not inside the temp folder (so data is saved permanently).
-db_path = os.path.join(os.path.abspath("."), "bullet_bot.db")
+# Resolve paths from the directory that contains main.py (stable when cwd differs, e.g. IDE run).
+_APP_ROOT = os.path.dirname(os.path.abspath(__file__))
 
-# 3. Initialize Services with these paths
-# (Note: You may need to update your Service __init__ methods to accept these paths)
-genai_service = GenAIService(model="gemini-2.5-pro") # Simplified!
+# Database stays next to main.py / EXE (not inside PyInstaller temp when bundled).
+db_path = os.path.join(_APP_ROOT, "bullet_bot.db")
+
+genai_service = GenAIService(model="gemini-2.5-pro", context_root=_APP_ROOT)
 db_service = DatabaseService(db_path=db_path)
 
 

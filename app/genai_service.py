@@ -6,9 +6,11 @@ from pathlib import Path
 
 load_dotenv()
 
+_CONTEXT_EXTENSIONS = (".txt", ".md")
+
+
 class GenAIService:
-    # 1. REMOVE the context_dir parameter from the signature
-    def __init__(self, model="gemini-2.5-pro-latest"):
+    def __init__(self, model="gemini-2.5-pro-latest", context_root: str | None = None):
         self.api_key = os.getenv("OPENAI_API_KEY")
         self.base_url = os.getenv("OPENAI_BASE_URL")
         self.model = model
@@ -18,22 +20,34 @@ class GenAIService:
             
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
 
-        # 2. REPLACE the old if/else block with this unified logic
-        # This single block correctly finds the path for both dev and PyInstaller
-        try:
-            # PyInstaller creates a temp folder and stores path in _MEIPASS
-            base_path = sys._MEIPASS
-        except Exception:
-            # Project root: one level above this package so "context/" is stable regardless of cwd
-            base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-        
-        self.context_path = os.path.join(base_path, "context")
+        self.context_path = self._resolve_context_path(context_root)
         
         self.context_files = {}
         self.system_prompt = ""
         self.supplemental_context = "" 
         
         self.refresh_context_list()
+
+    @staticmethod
+    def _resolve_context_path(context_root: str | None) -> str:
+        """Pick the first existing context/ directory (PyInstaller, entry script dir, package root, cwd)."""
+        pkg_parent = Path(__file__).resolve().parent.parent
+        default_missing = str(pkg_parent / "context")
+
+        candidates: list[str] = []
+        try:
+            candidates.append(os.path.join(sys._MEIPASS, "context"))
+        except Exception:
+            pass
+        if context_root:
+            candidates.append(os.path.join(os.path.abspath(context_root), "context"))
+        candidates.append(default_missing)
+        candidates.append(os.path.join(os.path.abspath(os.getcwd()), "context"))
+
+        for path in candidates:
+            if os.path.isdir(path):
+                return path
+        return default_missing
 
     def refresh_context_list(self):
         """Scans the context folder for all .txt files and maps them."""
@@ -47,7 +61,7 @@ class GenAIService:
             return
             
         for file in os.listdir(self.context_path):
-            if file.endswith(".txt"):
+            if file.lower().endswith(_CONTEXT_EXTENSIONS):
                 display_name = Path(file).stem
                 # Map the name to the FULL path of the file
                 self.context_files[display_name] = os.path.join(self.context_path, file)
@@ -72,8 +86,10 @@ class GenAIService:
                     self.system_prompt = f.read()
             except Exception as e:
                 print(f"Error reading context file: {e}")
+                self.system_prompt = "You are a helpful assistant."
         else:
             print(f"Warning: Context {context_name} not found. Using default.")
+            self.system_prompt = "You are a helpful assistant."
 
     def get_ai_response(self, user_input, history=None):
         if history is None:
