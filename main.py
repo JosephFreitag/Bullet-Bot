@@ -85,18 +85,10 @@ async def main(page: ft.Page):
         border=ft.InputBorder.NONE,
         filled=False,
     )
-    def on_context_change(e):
-        # This tells the service to update its internal self.system_prompt
-        genai_service.set_system_prompt(context_dropdown.value)
-        page.snack_bar = ft.SnackBar(ft.Text(f"Context switched to: {context_dropdown.value}"))
-        page.snack_bar.open = True
-        page.update()
-
     context_dropdown = ft.Dropdown(
         options=[ft.dropdown.Option(name) for name in genai_service.context_files.keys()],
         value="EPB" if "EPB" in genai_service.context_files else 
               (list(genai_service.context_files.keys())[0] if genai_service.context_files else None),
-        on_select=on_context_change, # <--- Link the function here
         width=150,
         border=ft.InputBorder.NONE,
         content_padding=ft.Padding(10, 0, 0, 0),
@@ -458,55 +450,25 @@ async def main(page: ft.Page):
         chat_display.controls.append(thinking_row)
         page.update()
 
-        # --- 2. NEW: Call the AI (Make sure to pass your history here if you have it) ---
-        response_text = genai_service.get_ai_response(user_input, history=[])
-
-        # --- 3. NEW: Remove Thinking Indicator and show the real response ---
-        chat_display.controls.remove(thinking_row)
-        
-        chat_display.controls.append(ft.Row(
-            controls=[
-                ft.Container(
-                    content=ft.Text("Bullet Bot", weight=ft.FontWeight.BOLD, color="#ff9800"), 
-                    alignment=ft.Alignment.TOP_LEFT,
-                    width=80
-                ),
-                ft.Markdown(response_text, extension_set=ft.MarkdownExtensionSet.COMMON_MARK, code_theme="atom-one-dark", expand=True)
-            ],
-            spacing=10,
-            vertical_alignment=ft.CrossAxisAlignment.START,
-        ))
-
-        # --- Re-enable UI ---
-        input_field.disabled = False
-        send_button.disabled = False
-        send_button.icon_color = "#B0B0B0"
-        page.update()
-
-        # --- Conversation & Backend Logic ---
-        # If this is the first message, create a new conversation record in the DB
+        # --- Conversation row: create if needed, then one API call with prior messages only ---
         if current_conversation_id is None:
-            title = f"[{context_dropdown.value}] {user_input[:25]}" # Use dropdown value for title
+            ctx_label = context_dropdown.value or "Default"
+            title = f"[{ctx_label}] {user_input[:25]}"
             current_conversation_id = db_service.create_conversation(logged_in_user['id'], title)
             await load_history_list()
 
-        # Add user message to DB and get the chat history
-        db_service.add_message(current_conversation_id, "user", user_input)
-        current_history = db_service.get_messages(current_conversation_id)
-        
-        # Get AI response in a separate thread to keep UI responsive
+        prior_history = db_service.get_messages(current_conversation_id)
+
         bot_response = await asyncio.to_thread(
-            genai_service.get_ai_response, 
-            user_input, 
-            current_history
+            genai_service.get_ai_response,
+            user_input,
+            prior_history,
         )
-        
-        # Add the bot's response to the database
+
+        db_service.add_message(current_conversation_id, "user", user_input)
         db_service.add_message(current_conversation_id, "assistant", bot_response)
 
-        # --- Display Bot's Response ---
-        # Remove the "thinking..." indicator
-        chat_display.controls.pop()
+        chat_display.controls.remove(thinking_row)
 
         # Generate the rich response view with copy buttons using the helper function
         bot_response_view = create_bot_response_view(page, bot_response)
