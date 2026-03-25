@@ -138,23 +138,29 @@ async def main(page: ft.Page):
         style=ft.ButtonStyle(color="#B0B0B0", bgcolor="#383838")
     )
 
-    # Create the button to trigger the drawer (Place this near your send button)
+    # Fine-tune opens the drawer; dot overlay (Stack) is reliable on desktop — IconButton.badge often is not.
     settings_button = ft.IconButton(
         icon=ft.Icons.TUNE,
         icon_color="#B0B0B0",
         tooltip="Fine-Tune Rules (extra instructions)",
         visible=False,
     )
+    fine_tune_indicator = ft.Container(
+        width=9,
+        height=9,
+        bgcolor="#ff9800",
+        border_radius=5,
+        opacity=0,
+        right=4,
+        top=4,
+    )
+    settings_button_stack = ft.Stack(
+        clip_behavior=ft.ClipBehavior.NONE,
+        controls=[settings_button, fine_tune_indicator],
+    )
 
     def sync_fine_tune_badge():
-        if (supp_input.value or "").strip():
-            settings_button.badge = ft.Badge(
-                label_visible=False,
-                bgcolor="#ff9800",
-                small_size=7,
-            )
-        else:
-            settings_button.badge = None
+        fine_tune_indicator.opacity = 1.0 if (supp_input.value or "").strip() else 0.0
 
     def on_supp_input_change(e):
         sync_fine_tune_badge()
@@ -308,7 +314,8 @@ async def main(page: ft.Page):
             
             # --- SHOW BUTTONS ---
             logout_button.visible = True
-            settings_button.visible = True 
+            settings_button.visible = True
+            settings_button_stack.visible = True
             sync_fine_tune_badge()
             
             page.appbar.title = ft.Text(f"Bullet Bot Ghost Writing For {user['username']}")
@@ -369,6 +376,7 @@ async def main(page: ft.Page):
         # --- HIDE BUTTONS ---
         logout_button.visible = False
         settings_button.visible = False
+        settings_button_stack.visible = False
         
         page.appbar.title = ft.Text("Bullet Bot Login")
         page.update()
@@ -693,7 +701,7 @@ async def main(page: ft.Page):
                             controls=[
                                 input_field,
                                 context_dropdown,
-                                settings_button,
+                                settings_button_stack,
                                 send_button,
                             ],
                         ),
@@ -753,6 +761,7 @@ async def main(page: ft.Page):
         chat_view.visible = True
         logout_button.visible = True
         settings_button.visible = True
+        settings_button_stack.visible = True
         sync_fine_tune_badge()
         page.appbar.title = ft.Text(f"Bullet Bot Ghost Writing For {user['username']}")
         await load_history_list()
