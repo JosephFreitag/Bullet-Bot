@@ -65,23 +65,11 @@ class GenAIService:
             self._active_context_name = None
             return
 
-        all_names = os.listdir(self.context_path)
-        found = sorted(f for f in all_names if f.lower().endswith(_CONTEXT_EXTENSIONS))
-        skipped = [f for f in all_names if f not in found and not f.startswith(".")]
-        for file in found:
+        for file in sorted(
+            f for f in os.listdir(self.context_path) if f.lower().endswith(_CONTEXT_EXTENSIONS)
+        ):
             display_name = Path(file).stem
             self.context_files[display_name] = os.path.join(self.context_path, file)
-
-        msg = (
-            f"Context: using folder {self.context_path!r} "
-            f"({len(self.context_files)} file(s): {', '.join(self.context_files.keys()) or 'none'})"
-        )
-        if skipped:
-            msg += f" | skipped non-text: {', '.join(skipped[:12])}"
-            if len(skipped) > 12:
-                msg += "…"
-        print(msg)
-        self._debug_log(msg)
 
         # Default startup prompt logic
         if "EPB" in self.context_files:
@@ -97,16 +85,6 @@ class GenAIService:
         with open(filepath, "r", encoding="utf-8-sig") as f:
             return f.read()
 
-    def _debug_log(self, line: str):
-        path = os.environ.get("BULLET_BOT_DEBUG_LOG")
-        if not path:
-            return
-        try:
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except Exception:
-            pass
-
     def set_system_prompt(self, context_name: str | None):
         """Loads the base system prompt from the selected file."""
         if not context_name:
@@ -118,13 +96,6 @@ class GenAIService:
             try:
                 self.system_prompt = self._read_context_file(filepath)
                 self._active_context_name = context_name
-                preview = self.system_prompt[:120].replace("\n", " ")
-                line = (
-                    f"Loaded context {context_name!r} ({len(self.system_prompt)} chars) "
-                    f"from {filepath!r} preview: {preview!r}..."
-                )
-                print(line)
-                self._debug_log(line)
             except Exception as e:
                 print(f"Error reading context file: {e}")
                 self.system_prompt = "You are a helpful assistant."
@@ -144,20 +115,6 @@ class GenAIService:
                 self.system_prompt = self._read_context_file(filepath)
             except Exception as e:
                 print(f"Error re-reading context file: {e}")
-
-    def get_context_status(self) -> dict:
-        """Snapshot for UI: whether files load and how large the active prompt is."""
-        names = sorted(self.context_files.keys())
-        n_chars = len((self.system_prompt or "").strip())
-        return {
-            "context_path": self.context_path,
-            "path_exists": os.path.isdir(self.context_path),
-            "file_count": len(self.context_files),
-            "names": names,
-            "active": self._active_context_name,
-            "prompt_chars": n_chars,
-            "using_default_prompt": self._active_context_name is None or n_chars == 0,
-        }
 
     def get_ai_response(self, user_input, history=None):
         if history is None:

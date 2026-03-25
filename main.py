@@ -95,36 +95,6 @@ async def main(page: ft.Page):
         color="#B0B0B0",
         text_size=13,
     )
-
-    context_status_text = ft.Text(
-        "",
-        size=11,
-        selectable=True,
-        max_lines=4,
-        overflow=ft.TextOverflow.VISIBLE,
-    )
-
-    def refresh_context_status_ui():
-        s = genai_service.get_context_status()
-        full_path = s["context_path"]
-        if s["file_count"] == 0:
-            context_status_text.value = (
-                f"No .txt/.md context files found. Folder: {full_path}\n"
-                f"Tip: add EPB.txt (or set BULLET_BOT_CONTEXT in .env to your context folder)."
-            )
-            context_status_text.color = "#e57373"
-        elif s["using_default_prompt"]:
-            context_status_text.value = (
-                f"Found {s['file_count']} file(s) {s['names']!r} but active prompt is empty/default. "
-                f"Choose one in the dropdown."
-            )
-            context_status_text.color = "#ffb74d"
-        else:
-            context_status_text.value = (
-                f"Loaded “{s['active']}” ({s['prompt_chars']} chars) from:\n{full_path}"
-            )
-            context_status_text.color = "#9e9e9e"
-        context_status_text.tooltip = full_path
     
     send_button = ft.IconButton(
         icon=ft.Icons.SEND, 
@@ -363,7 +333,6 @@ async def main(page: ft.Page):
             new_context = context_dropdown.value
             # Tell the backend to load the file
             genai_service.set_system_prompt(new_context)
-            refresh_context_status_ui()
 
             # Show visual feedback
             page.snack_bar = ft.SnackBar(
@@ -372,9 +341,7 @@ async def main(page: ft.Page):
                 duration=1500
             )
             page.snack_bar.open = True
-            print(f"Successfully switched to: {new_context}")
         except Exception as ex:
-            print(f"Error switching context: {ex}")
             page.snack_bar = ft.SnackBar(ft.Text(f"Error: {ex}"), bgcolor="red")
             page.snack_bar.open = True
         
@@ -420,7 +387,6 @@ async def main(page: ft.Page):
         
         # Make sure the service is synced to whatever the dropdown is currently showing
         genai_service.set_system_prompt(context_dropdown.value)
-        refresh_context_status_ui()
 
         chat_display.controls.clear()
         input_field.value = ""
@@ -441,7 +407,6 @@ async def main(page: ft.Page):
         # 1. NEW: Sync BOTH the dropdown and the supplemental text box right away
         genai_service.set_system_prompt(context_dropdown.value)
         genai_service.supplemental_context = supp_input.value # <--- Adds your manual rules
-        refresh_context_status_ui()
 
         user_input = input_field.value.strip()
         if not logged_in_user or not user_input:
@@ -549,7 +514,6 @@ async def main(page: ft.Page):
         
         context_dropdown.value = detected_context
         genai_service.set_system_prompt(detected_context)
-        refresh_context_status_ui()
 
         # --- 3. Load and Display Messages ---
         messages = db_service.get_messages(conv_id)
@@ -676,20 +640,13 @@ async def main(page: ft.Page):
                         border=ft.Border.all(1, "#424242"),
                         border_radius=8,
                         bgcolor="#2d2d2d",
-                        content=ft.Column(
-                            spacing=4,
-                            tight=True,
+                        content=ft.Row(
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
                             controls=[
-                                ft.Row(
-                                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                                    controls=[
-                                        input_field,
-                                        context_dropdown,
-                                        settings_button,
-                                        send_button,
-                                    ],
-                                ),
-                                context_status_text,
+                                input_field,
+                                context_dropdown,
+                                settings_button,
+                                send_button,
                             ],
                         ),
                     ),
@@ -714,7 +671,6 @@ async def main(page: ft.Page):
         horizontal_alignment=ft.CrossAxisAlignment.CENTER,
     )
 
-    refresh_context_status_ui()
     page.add(main_layout)
     page.update()
 
