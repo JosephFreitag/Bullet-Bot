@@ -116,13 +116,12 @@ class GenAIService:
             except Exception as e:
                 print(f"Error re-reading context file: {e}")
 
-    def get_ai_response(self, user_input, history=None):
+    def _build_chat_messages(self, user_input, history=None):
         if history is None:
             history = []
 
         self._reload_active_context_from_disk()
 
-        # --- Combine base prompt with supplemental rules from the drawer ---
         full_system_instructions = (self.system_prompt or "").strip()
         if not full_system_instructions:
             full_system_instructions = "You are a helpful assistant."
@@ -131,8 +130,6 @@ class GenAIService:
                 f"\n\nADDITIONAL USER RULES/CONTEXT:\n{self.supplemental_context.strip()}"
             )
 
-        # Repeat instructions in the final user turn so they survive providers that ignore
-        # role=system, long histories that truncate from the start, or odd OpenAI-compat gateways.
         final_user_content = (
             "Follow ALL instructions below for your reply. They override any generic assistant behavior.\n\n"
             "--- INSTRUCTIONS ---\n"
@@ -145,13 +142,35 @@ class GenAIService:
         messages = [{"role": "system", "content": full_system_instructions}]
         messages.extend(history)
         messages.append({"role": "user", "content": final_user_content})
-        
+        return messages
+
+    def get_ai_response(self, user_input, history=None):
+        messages = self._build_chat_messages(user_input, history)
         try:
             response = self.client.chat.completions.create(
-                model=self.model, 
-                messages=messages
+                model=self.model,
+                messages=messages,
             )
             return response.choices[0].message.content
         except Exception as e:
             print(f"\nAPI Error: {e}")
             return f"Sorry, I encountered an error: {e}"
+
+    def stream_ai_response(self, user_input, history=None):
+        """Yields text fragments from the model (OpenAI-compatible streaming)."""
+        messages = self._build_chat_messages(user_input, history)
+        try:
+            stream = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                stream=True,
+            )
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    yield delta.content
+        except Exception as e:
+            print(f"\nAPI Error: {e}")
+            yield f"Sorry, I encountered an error: {e}"

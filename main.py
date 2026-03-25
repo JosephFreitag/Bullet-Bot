@@ -3,7 +3,9 @@ import re
 import asyncio
 import json
 import os
+import queue
 import sys
+import threading
 from app.genai_service import GenAIService
 from app.database import DatabaseService
 from flet import Clipboard
@@ -489,22 +491,7 @@ async def main(page: ft.Page):
             vertical_alignment=ft.CrossAxisAlignment.START,
         ))
 
-        # --- Display "Thinking..." Indicator ---
-        thinking_row = ft.Row( # Renamed for clarity
-            controls=[
-                ft.Container(
-                    content=ft.Text("Bullet Bot", weight=ft.FontWeight.BOLD, color="#ff9800"), 
-                    alignment=ft.Alignment.TOP_LEFT,
-                    width=80
-                ),
-                ft.ProgressRing(width=16, height=16, stroke_width=2)
-            ],
-            spacing=10,
-        )
-        chat_display.controls.append(thinking_row)
-        page.update()
-
-        # --- Conversation row: create if needed, then one API call with prior messages only ---
+        # --- Conversation row: create if needed, then stream with full prior history ---
         if current_conversation_id is None:
             ctx_label = context_dropdown.value or "Default"
             title = f"[{ctx_label}] {user_input[:25]}"
@@ -513,22 +500,72 @@ async def main(page: ft.Page):
 
         prior_history = db_service.get_messages(current_conversation_id)
 
-        bot_response = await asyncio.to_thread(
-            genai_service.get_ai_response,
-            user_input,
-            prior_history,
+        stream_md = ft.Markdown(
+            "",
+            selectable=True,
+            expand=True,
+            extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
         )
+        streaming_row = ft.Row(
+            controls=[
+                ft.Container(
+                    content=ft.Text("Bullet Bot", weight=ft.FontWeight.BOLD, color="#ff9800"),
+                    alignment=ft.Alignment.TOP_LEFT,
+                    width=80,
+                ),
+                stream_md,
+            ],
+            spacing=10,
+            vertical_alignment=ft.CrossAxisAlignment.START,
+        )
+        chat_display.controls.append(streaming_row)
+        page.update()
 
+        chunk_queue: queue.Queue = queue.Queue()
+
+        def run_stream():
+            try:
+                for fragment in genai_service.stream_ai_response(user_input, prior_history):
+                    chunk_queue.put(("delta", fragment))
+            except Exception as ex:
+                chunk_queue.put(("error", str(ex)))
+            finally:
+                chunk_queue.put(None)
+
+        threading.Thread(target=run_stream, daemon=True).start()
+
+        assembled: list[str] = []
+        stream_done = False
+        while not stream_done:
+            try:
+                while True:
+                    item = chunk_queue.get_nowait()
+                    if item is None:
+                        stream_done = True
+                        break
+                    kind, payload = item
+                    if kind == "delta":
+                        assembled.append(payload)
+                        stream_md.value = "".join(assembled)
+                    elif kind == "error":
+                        assembled.append(f"\n\n*(Error: {payload})*")
+                        stream_md.value = "".join(assembled)
+                        stream_done = True
+                        break
+            except queue.Empty:
+                pass
+            if not stream_done:
+                await asyncio.sleep(0.02)
+            page.update()
+
+        bot_response = "".join(assembled).strip()
+        if not bot_response:
+            bot_response = "(No response)"
         db_service.add_message(current_conversation_id, "user", user_input)
         db_service.add_message(current_conversation_id, "assistant", bot_response)
 
-        chat_display.controls.remove(thinking_row)
-
-        # Generate the rich response view with copy buttons using the helper function
-        bot_response_view = create_bot_response_view(page, bot_response)
-        
-        # Add the generated view to the chat display
-        chat_display.controls.append(bot_response_view)
+        chat_display.controls.remove(streaming_row)
+        chat_display.controls.append(create_bot_response_view(page, bot_response))
 
         # --- UI State: Re-enable inputs ---
         input_field.disabled = False
