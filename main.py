@@ -1,6 +1,7 @@
 import flet as ft
 import re
 import asyncio
+import json
 import os
 import sys
 from app.genai_service import GenAIService
@@ -12,6 +13,42 @@ _APP_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # Database stays next to main.py / EXE (not inside PyInstaller temp when bundled).
 db_path = os.path.join(_APP_ROOT, "bullet_bot.db")
+PREFS_PATH = os.path.join(_APP_ROOT, "bullet_bot_prefs.json")
+
+
+def load_prefs():
+    if not os.path.isfile(PREFS_PATH):
+        return {}
+    try:
+        with open(PREFS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_prefs(prefs: dict):
+    try:
+        with open(PREFS_PATH, "w", encoding="utf-8") as f:
+            json.dump(prefs, f, indent=2)
+    except OSError:
+        pass
+
+
+def persist_logged_in_user_id(user_id: int | None):
+    p = load_prefs()
+    if user_id is None:
+        p.pop("user_id", None)
+    else:
+        p["user_id"] = int(user_id)
+    save_prefs(p)
+
+
+def persist_supplemental_text(text: str):
+    p = load_prefs()
+    p["supplemental_context"] = text
+    save_prefs(p)
+
 
 genai_service = GenAIService(model="gemini-2.5-pro", context_root=_APP_ROOT)
 db_service = DatabaseService(db_path=db_path)
@@ -45,15 +82,7 @@ async def main(page: ft.Page):
 
         # --- 2. Application State Management ---
     current_conversation_id = None
-    logged_in_user = None  # This replaces the session/storage entirely
-
-    def get_user_from_session():
-        """Retrieves the current user's data from client storage."""
-        return page.client_storage.get("user")
-
-    def set_user_in_session(user_data):
-        """Saves the current user's data to client storage."""
-        page.client_storage.set("user", user_data)
+    logged_in_user = None
 
     # --- 3. UI Control Definitions (Moved placeholders here) ---
     # We define the controls first, then define functions, 
@@ -111,17 +140,33 @@ async def main(page: ft.Page):
 
     # Create the button to trigger the drawer (Place this near your send button)
     settings_button = ft.IconButton(
-        icon=ft.Icons.TUNE, 
-        icon_color="#B0B0B0", 
-        tooltip="Fine-Tune Rules", 
-        visible=False
-        # DO NOT PUT on_click HERE
+        icon=ft.Icons.TUNE,
+        icon_color="#B0B0B0",
+        tooltip="Fine-Tune Rules (extra instructions)",
+        visible=False,
     )
 
+    def sync_fine_tune_badge():
+        if (supp_input.value or "").strip():
+            settings_button.badge = ft.Badge(
+                label_visible=False,
+                bgcolor="#ff9800",
+                small_size=7,
+            )
+        else:
+            settings_button.badge = None
+
+    def on_supp_input_change(e):
+        sync_fine_tune_badge()
+        page.update()
+
+    supp_input.on_change = on_supp_input_change
+
     async def save_supp_rules(e):
-        # 1. Apply the logic to the AI service
-        genai_service.supplemental_context = supp_input.value
-        
+        genai_service.supplemental_context = supp_input.value or ""
+        persist_supplemental_text(supp_input.value or "")
+        sync_fine_tune_badge()
+
         # 2. Use your exact working "toast" logic for 0.82
         page.show_dialog(
             ft.SnackBar(
@@ -257,12 +302,14 @@ async def main(page: ft.Page):
         user = db_service.verify_user(login_username_field.value, login_password_field.value)
         if user:
             logged_in_user = user
+            persist_logged_in_user_id(user["id"])
             login_view.visible = False
             chat_view.visible = True
             
             # --- SHOW BUTTONS ---
             logout_button.visible = True
             settings_button.visible = True 
+            sync_fine_tune_badge()
             
             page.appbar.title = ft.Text(f"Bullet Bot Ghost Writing For {user['username']}")
             await load_history_list()
@@ -311,6 +358,7 @@ async def main(page: ft.Page):
         nonlocal logged_in_user, current_conversation_id
         logged_in_user = None
         current_conversation_id = None
+        persist_logged_in_user_id(None)
         
         # --- DETACH DRAWER TO HIDE HAMBURGER ---
         page.end_drawer = None 
@@ -672,7 +720,46 @@ async def main(page: ft.Page):
     )
 
     page.add(main_layout)
-    page.update()
+
+    async def try_restore_session():
+        nonlocal logged_in_user
+        prefs = load_prefs()
+        raw_supp = prefs.get("supplemental_context")
+        if isinstance(raw_supp, str):
+            supp_input.value = raw_supp
+            genai_service.supplemental_context = raw_supp
+        sync_fine_tune_badge()
+
+        uid = prefs.get("user_id")
+        if uid is None:
+            page.update()
+            return
+        try:
+            uid = int(uid)
+        except (TypeError, ValueError):
+            page.update()
+            return
+
+        user = db_service.get_user_by_id(uid)
+        if not user:
+            p = load_prefs()
+            p.pop("user_id", None)
+            save_prefs(p)
+            page.update()
+            return
+
+        logged_in_user = user
+        login_view.visible = False
+        chat_view.visible = True
+        logout_button.visible = True
+        settings_button.visible = True
+        sync_fine_tune_badge()
+        page.appbar.title = ft.Text(f"Bullet Bot Ghost Writing For {user['username']}")
+        await load_history_list()
+        await START_new_chat(None)
+        page.update()
+
+    page.run_task(try_restore_session)
 
 # --- Application Entry Point ---
 if __name__ == "__main__":

@@ -65,6 +65,15 @@ class DatabaseService:
             return {"id": user[0], "username": user[1], "password_hash": user[2]}
         return None
 
+    def get_user_by_id(self, user_id):
+        """Retrieves a user by id (for restoring a saved session)."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT id, username FROM users WHERE id = ?", (user_id,))
+        row = cursor.fetchone()
+        if row:
+            return {"id": row[0], "username": row[1]}
+        return None
+
     def verify_user(self, username, password):
         """Verifies a user's password."""
         user = self.get_user(username)
