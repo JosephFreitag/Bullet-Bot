@@ -17,8 +17,14 @@ from flet import Clipboard
 DAILY_TOKEN_LIMIT = 1_000_000
 TOKEN_USAGE_POLL_SECONDS = 15
 
-# Resolve paths from the directory that contains main.py (stable when cwd differs, e.g. IDE run).
-_APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+# Writable app root: folder with main.py in dev; folder with the .exe when frozen (PyInstaller).
+def _resolve_app_root() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+_APP_ROOT = _resolve_app_root()
 
 # Database stays next to main.py / EXE (not inside PyInstaller temp when bundled).
 db_path = os.path.join(_APP_ROOT, "bullet_bot.db")
