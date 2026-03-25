@@ -8,6 +8,10 @@ import sys
 import threading
 from app.genai_service import GenAIService
 from app.database import DatabaseService, utc_date_string
+from app.openai_org_usage import (
+    fetch_completions_tokens_today_utc,
+    should_use_openai_org_usage,
+)
 from flet import Clipboard
 
 DAILY_TOKEN_LIMIT = 1_000_000
@@ -96,13 +100,59 @@ async def main(page: ft.Page):
     current_conversation_id = None
     logged_in_user = None
     token_usage_poll_task: asyncio.Task | None = None
+    token_usage_state = {
+        "local_total": 0,
+        "org_total": None,
+        "org_err": None,
+    }
 
-    def refresh_token_usage_display():
-        u = db_service.get_token_usage_for_date()
-        total = u["total_tokens"]
-        token_usage_text.value = (
-            f"Tokens today (all users, UTC): {total:,} / {DAILY_TOKEN_LIMIT:,}"
-        )
+    def _effective_token_total() -> int:
+        st = token_usage_state
+        if (
+            should_use_openai_org_usage()
+            and (os.environ.get("OPENAI_ADMIN_API_KEY") or "").strip()
+            and st["org_total"] is not None
+        ):
+            return int(st["org_total"])
+        return int(st["local_total"])
+
+    async def refresh_token_usage_async():
+        st = token_usage_state
+        st["local_total"] = db_service.get_token_usage_for_date()["total_tokens"]
+        st["org_total"] = None
+        st["org_err"] = None
+
+        admin_key = (os.environ.get("OPENAI_ADMIN_API_KEY") or "").strip()
+        if should_use_openai_org_usage() and admin_key:
+            total, err = await asyncio.to_thread(
+                fetch_completions_tokens_today_utc, admin_key
+            )
+            if err:
+                st["org_err"] = err
+            else:
+                st["org_total"] = total
+
+        total = _effective_token_total()
+        if st["org_err"]:
+            token_usage_text.tooltip = (
+                f"OpenAI org usage API error: {st['org_err']}. "
+                f"Showing this app's SQLite count. Admin key: platform.openai.com → Organization → Admin keys."
+            )
+            src = "this app (SQLite)"
+        elif st["org_total"] is not None:
+            token_usage_text.tooltip = (
+                "Totals from OpenAI GET /v1/organization/usage/completions (UTC day, your whole org). "
+                "Requires OPENAI_ADMIN_API_KEY."
+            )
+            src = "OpenAI org (API)"
+        else:
+            token_usage_text.tooltip = (
+                "Per-request totals summed in SQLite for this app (UTC day). "
+                "Set OPENAI_ADMIN_API_KEY + OPENAI_ORG_USAGE=1 for OpenAI dashboard-aligned counts."
+            )
+            src = "this app (SQLite)"
+
+        token_usage_text.value = f"Tokens today ({src}): {total:,} / {DAILY_TOKEN_LIMIT:,}"
         if total >= DAILY_TOKEN_LIMIT:
             token_usage_text.color = "#e57373"
         elif total >= int(DAILY_TOKEN_LIMIT * 0.9):
@@ -110,13 +160,16 @@ async def main(page: ft.Page):
         else:
             token_usage_text.color = "#9e9e9e"
 
+    def schedule_token_usage_refresh():
+        page.run_task(refresh_token_usage_async)
+
     def start_token_usage_polling():
         nonlocal token_usage_poll_task
 
         async def poll_loop():
             try:
                 while logged_in_user is not None:
-                    refresh_token_usage_display()
+                    await refresh_token_usage_async()
                     page.update()
                     await asyncio.sleep(TOKEN_USAGE_POLL_SECONDS)
             except asyncio.CancelledError:
@@ -365,7 +418,7 @@ async def main(page: ft.Page):
             settings_button.visible = True
             settings_button_stack.visible = True
             sync_fine_tune_badge()
-            refresh_token_usage_display()
+            schedule_token_usage_refresh()
             start_token_usage_polling()
             
             page.appbar.title = ft.Text(f"Bullet Bot Ghost Writing For {user['username']}")
@@ -417,7 +470,7 @@ async def main(page: ft.Page):
         current_conversation_id = None
         persist_logged_in_user_id(None)
         stop_token_usage_polling()
-        refresh_token_usage_display()
+        schedule_token_usage_refresh()
         
         # --- DETACH DRAWER TO HIDE HAMBURGER ---
         page.end_drawer = None 
@@ -520,8 +573,8 @@ async def main(page: ft.Page):
         if not logged_in_user or not user_input:
             return
 
-        usage_pre = db_service.get_token_usage_for_date()
-        if usage_pre["total_tokens"] >= DAILY_TOKEN_LIMIT:
+        await refresh_token_usage_async()
+        if _effective_token_total() >= DAILY_TOKEN_LIMIT:
             page.snack_bar = ft.SnackBar(
                 content=ft.Text(
                     f"Daily token limit reached ({DAILY_TOKEN_LIMIT:,} tokens UTC day). "
@@ -641,7 +694,7 @@ async def main(page: ft.Page):
             est_in = genai_service.estimate_prompt_tokens(user_input, prior_history)
             est_out = max(1, len(bot_response) // 4)
             db_service.add_token_usage(est_in + est_out, est_in, est_out)
-        refresh_token_usage_display()
+        await refresh_token_usage_async()
 
         chat_display.controls.remove(streaming_row)
         chat_display.controls.append(create_bot_response_view(page, bot_response))
@@ -844,7 +897,7 @@ async def main(page: ft.Page):
     )
 
     page.add(main_layout)
-    refresh_token_usage_display()
+    schedule_token_usage_refresh()
 
     async def try_restore_session():
         nonlocal logged_in_user
@@ -857,13 +910,13 @@ async def main(page: ft.Page):
 
         uid = prefs.get("user_id")
         if uid is None:
-            refresh_token_usage_display()
+            schedule_token_usage_refresh()
             page.update()
             return
         try:
             uid = int(uid)
         except (TypeError, ValueError):
-            refresh_token_usage_display()
+            schedule_token_usage_refresh()
             page.update()
             return
 
@@ -872,7 +925,7 @@ async def main(page: ft.Page):
             p = load_prefs()
             p.pop("user_id", None)
             save_prefs(p)
-            refresh_token_usage_display()
+            schedule_token_usage_refresh()
             page.update()
             return
 
@@ -884,7 +937,7 @@ async def main(page: ft.Page):
         settings_button_stack.visible = True
         sync_fine_tune_badge()
         page.appbar.title = ft.Text(f"Bullet Bot Ghost Writing For {user['username']}")
-        refresh_token_usage_display()
+        schedule_token_usage_refresh()
         start_token_usage_polling()
         await load_history_list()
         await START_new_chat(None)
