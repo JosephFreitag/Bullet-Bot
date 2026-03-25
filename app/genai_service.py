@@ -24,8 +24,8 @@ class GenAIService:
             # PyInstaller creates a temp folder and stores path in _MEIPASS
             base_path = sys._MEIPASS
         except Exception:
-            # If not packaged, use the normal script path
-            base_path = os.path.abspath(".")
+            # Project root: one level above this package so "context/" is stable regardless of cwd
+            base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
         
         self.context_path = os.path.join(base_path, "context")
         
@@ -60,8 +60,11 @@ class GenAIService:
         else:
             self.system_prompt = "You are a helpful assistant."
 
-    def set_system_prompt(self, context_name: str):
+    def set_system_prompt(self, context_name: str | None):
         """Loads the base system prompt from the selected file."""
+        if not context_name:
+            self.system_prompt = "You are a helpful assistant."
+            return
         filepath = self.context_files.get(context_name)
         if filepath and os.path.exists(filepath):
             try:
