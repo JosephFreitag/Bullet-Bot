@@ -22,15 +22,10 @@ from app.openai_org_usage import (
 )
 from flet import Clipboard
 
-# flet-dropzone: native plugin; stock Flet/PyInstaller client → "Unknown control: flet_dropzone".
-# Use Attach + Ctrl+Shift+V by default; set BULLET_BOT_DROPZONE=1 after `flet build` with the plugin.
-USE_FLET_DROPZONE = os.environ.get("BULLET_BOT_DROPZONE", "").lower() in (
-    "1",
-    "true",
-    "yes",
-)
+# flet-dropzone: use when installed (needs Flet client built with the plugin — e.g. flet build windows).
+# Set BULLET_BOT_DROPZONE=0 to force plain strip (no native drop) if the client shows Unknown control.
 Dropzone = None
-if USE_FLET_DROPZONE:
+if os.environ.get("BULLET_BOT_DROPZONE", "").lower() not in ("0", "false", "no"):
     try:
         from flet_dropzone import Dropzone
     except ImportError:
@@ -406,8 +401,8 @@ async def main(page: ft.Page):
             ft.Icon(ft.Icons.CLOUD_UPLOAD_OUTLINED, size=18, color="#757575"),
             ft.Text(
                 (
-                    "Drag & drop works when BULLET_BOT_DROPZONE=1 and the app is built with "
-                    "flet-dropzone (see README). Otherwise: Attach button or Ctrl+Shift+V."
+                    "Install flet-dropzone + use a Flet build that includes the plugin, or use "
+                    "Attach / Ctrl+Shift+V. Set BULLET_BOT_DROPZONE=0 to hide this warning."
                 )
                 if Dropzone is None
                 else "Drop files or images here — also Attach or Ctrl+Shift+V",
@@ -779,16 +774,25 @@ async def main(page: ft.Page):
     async def send_message_click(e):
         nonlocal current_conversation_id
 
-        # 1. NEW: Sync BOTH the dropdown and the supplemental text box right away
         genai_service.set_system_prompt(context_dropdown.value)
-        genai_service.supplemental_context = supp_input.value # <--- Adds your manual rules
+        genai_service.supplemental_context = supp_input.value
 
         user_input = input_field.value.strip()
         atts = list(pending_attachments)
         if not logged_in_user or (not user_input and not atts):
             return
 
-        await refresh_token_usage_async()
+        try:
+            await refresh_token_usage_async()
+        except Exception as ex:
+            page.snack_bar = ft.SnackBar(
+                ft.Text(f"Could not refresh usage: {ex}"),
+                bgcolor="#c62828",
+            )
+            page.snack_bar.open = True
+            page.update()
+            return
+
         if _effective_token_total() >= DAILY_TOKEN_LIMIT:
             page.snack_bar = ft.SnackBar(
                 content=ft.Text(
@@ -810,7 +814,6 @@ async def main(page: ft.Page):
             page.update()
             return
 
-        # --- UI State: Disable inputs while processing ---
         input_field.disabled = True
         send_button.disabled = True
         send_button.icon_color = "#424242"
@@ -820,138 +823,138 @@ async def main(page: ft.Page):
         rebuild_attachment_chips()
         page.update()
 
-        # --- Display User's Message ---
-        user_body = ft.Column(
-            spacing=6,
-            tight=True,
-            expand=True,
-            controls=user_bubble_widgets(storage_record(user_input, atts), ft),
-        )
-        chat_display.controls.append(
-            ft.Row(
+        try:
+            user_body = ft.Column(
+                spacing=6,
+                tight=True,
+                expand=True,
+                controls=user_bubble_widgets(storage_record(user_input, atts), ft),
+            )
+            chat_display.controls.append(
+                ft.Row(
+                    controls=[
+                        ft.Container(
+                            content=ft.Text("You", weight=ft.FontWeight.BOLD, color="#81d4fa"),
+                            alignment=ft.Alignment.TOP_LEFT,
+                            width=80,
+                        ),
+                        user_body,
+                    ],
+                    spacing=10,
+                    vertical_alignment=ft.CrossAxisAlignment.START,
+                )
+            )
+
+            if current_conversation_id is None:
+                ctx_label = context_dropdown.value or "Default"
+                title_seed = user_input.strip() or (atts[0].name if atts else "attachment")
+                title = f"[{ctx_label}] {title_seed[:25]}"
+                current_conversation_id = db_service.create_conversation(logged_in_user['id'], title)
+                await load_history_list()
+
+            prior_history = db_service.get_messages(current_conversation_id)
+
+            stream_usage: list[dict] = []
+
+            stream_md = ft.Markdown(
+                "",
+                selectable=True,
+                expand=True,
+                extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
+            )
+            streaming_row = ft.Row(
                 controls=[
                     ft.Container(
-                        content=ft.Text("You", weight=ft.FontWeight.BOLD, color="#81d4fa"),
+                        content=ft.Text("Bullet Bot", weight=ft.FontWeight.BOLD, color="#ff9800"),
                         alignment=ft.Alignment.TOP_LEFT,
                         width=80,
                     ),
-                    user_body,
+                    stream_md,
                 ],
                 spacing=10,
                 vertical_alignment=ft.CrossAxisAlignment.START,
             )
-        )
-
-        # --- Conversation row: create if needed, then stream with full prior history ---
-        if current_conversation_id is None:
-            ctx_label = context_dropdown.value or "Default"
-            title_seed = user_input.strip() or (atts[0].name if atts else "attachment")
-            title = f"[{ctx_label}] {title_seed[:25]}"
-            current_conversation_id = db_service.create_conversation(logged_in_user['id'], title)
-            await load_history_list()
-
-        prior_history = db_service.get_messages(current_conversation_id)
-
-        stream_usage: list[dict] = []
-
-        stream_md = ft.Markdown(
-            "",
-            selectable=True,
-            expand=True,
-            extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
-        )
-        streaming_row = ft.Row(
-            controls=[
-                ft.Container(
-                    content=ft.Text("Bullet Bot", weight=ft.FontWeight.BOLD, color="#ff9800"),
-                    alignment=ft.Alignment.TOP_LEFT,
-                    width=80,
-                ),
-                stream_md,
-            ],
-            spacing=10,
-            vertical_alignment=ft.CrossAxisAlignment.START,
-        )
-        chat_display.controls.append(streaming_row)
-        page.update()
-
-        chunk_queue: queue.Queue = queue.Queue()
-
-        def run_stream():
-            try:
-                for fragment in genai_service.stream_ai_response(
-                    user_input,
-                    prior_history,
-                    usage_out=stream_usage,
-                    attachments=atts,
-                ):
-                    chunk_queue.put(("delta", fragment))
-            except ValueError as ex:
-                chunk_queue.put(("error", str(ex)))
-            except Exception as ex:
-                chunk_queue.put(("error", str(ex)))
-            finally:
-                chunk_queue.put(None)
-
-        threading.Thread(target=run_stream, daemon=True).start()
-
-        assembled: list[str] = []
-        stream_done = False
-        while not stream_done:
-            try:
-                while True:
-                    item = chunk_queue.get_nowait()
-                    if item is None:
-                        stream_done = True
-                        break
-                    kind, payload = item
-                    if kind == "delta":
-                        assembled.append(payload)
-                        stream_md.value = "".join(assembled)
-                    elif kind == "error":
-                        assembled.append(f"\n\n*(Error: {payload})*")
-                        stream_md.value = "".join(assembled)
-                        stream_done = True
-                        break
-            except queue.Empty:
-                pass
-            if not stream_done:
-                await asyncio.sleep(0.02)
+            chat_display.controls.append(streaming_row)
             page.update()
 
-        bot_response = "".join(assembled).strip()
-        if not bot_response:
-            bot_response = "(No response)"
-        db_service.add_message(
-            current_conversation_id, "user", storage_record(user_input, atts)
-        )
-        db_service.add_message(current_conversation_id, "assistant", bot_response)
+            chunk_queue: queue.Queue = queue.Queue()
 
-        if stream_usage:
-            u = stream_usage[0]
-            db_service.add_token_usage(
-                u["total_tokens"], u["prompt_tokens"], u["completion_tokens"]
+            def run_stream():
+                try:
+                    for fragment in genai_service.stream_ai_response(
+                        user_input,
+                        prior_history,
+                        usage_out=stream_usage,
+                        attachments=atts,
+                    ):
+                        chunk_queue.put(("delta", fragment))
+                except ValueError as ex:
+                    chunk_queue.put(("error", str(ex)))
+                except Exception as ex:
+                    chunk_queue.put(("error", str(ex)))
+                finally:
+                    chunk_queue.put(None)
+
+            threading.Thread(target=run_stream, daemon=True).start()
+
+            assembled: list[str] = []
+            stream_done = False
+            while not stream_done:
+                try:
+                    while True:
+                        item = chunk_queue.get_nowait()
+                        if item is None:
+                            stream_done = True
+                            break
+                        kind, payload = item
+                        if kind == "delta":
+                            assembled.append(payload)
+                            stream_md.value = "".join(assembled)
+                        elif kind == "error":
+                            assembled.append(f"\n\n*(Error: {payload})*")
+                            stream_md.value = "".join(assembled)
+                            stream_done = True
+                            break
+                except queue.Empty:
+                    pass
+                if not stream_done:
+                    await asyncio.sleep(0.02)
+                page.update()
+
+            bot_response = "".join(assembled).strip()
+            if not bot_response:
+                bot_response = "(No response)"
+            db_service.add_message(
+                current_conversation_id, "user", storage_record(user_input, atts)
             )
-        else:
-            est_in = genai_service.estimate_prompt_tokens(
-                user_input, prior_history, atts
-            )
-            est_out = max(1, len(bot_response) // 4)
-            db_service.add_token_usage(est_in + est_out, est_in, est_out)
-        await refresh_token_usage_async()
+            db_service.add_message(current_conversation_id, "assistant", bot_response)
 
-        chat_display.controls.remove(streaming_row)
-        chat_display.controls.append(create_bot_response_view(page, bot_response))
+            if stream_usage:
+                u = stream_usage[0]
+                db_service.add_token_usage(
+                    u["total_tokens"], u["prompt_tokens"], u["completion_tokens"]
+                )
+            else:
+                est_in = genai_service.estimate_prompt_tokens(
+                    user_input, prior_history, atts
+                )
+                est_out = max(1, len(bot_response) // 4)
+                db_service.add_token_usage(est_in + est_out, est_in, est_out)
+            try:
+                await refresh_token_usage_async()
+            except Exception:
+                pass
 
-        # --- UI State: Re-enable inputs ---
-        input_field.disabled = False
-        send_button.disabled = False
-        send_button.icon_color = "#B0B0B0" # Back to normal
-        attach_button.disabled = False
-        
-        # Final update and focus
-        await input_field.focus()
-        page.update()
+            chat_display.controls.remove(streaming_row)
+            chat_display.controls.append(create_bot_response_view(page, bot_response))
+
+            await input_field.focus()
+        finally:
+            input_field.disabled = False
+            send_button.disabled = False
+            send_button.icon_color = "#B0B0B0"
+            attach_button.disabled = False
+            page.update()
 
 
     async def load_conversation_click(e):
@@ -1019,7 +1022,7 @@ async def main(page: ft.Page):
     async def on_keyboard(e: ft.KeyboardEvent):
         """Ctrl+Enter send; Ctrl+Shift+V attach clipboard image or files (desktop)."""
         if e.ctrl and e.key == "Enter":
-            await send_message_click(None)
+            page.run_task(send_message_click, None)
             return
         if not logged_in_user or not (e.ctrl and e.shift):
             return
@@ -1067,8 +1070,11 @@ async def main(page: ft.Page):
         page.update()
 
     # Assign event handlers to the controls
-    send_button.on_click = send_message_click
-    input_field.on_submit = send_message_click
+    def schedule_send(e):
+        page.run_task(send_message_click, e)
+
+    send_button.on_click = schedule_send
+    input_field.on_submit = schedule_send
     page.on_keyboard_event = on_keyboard
     login_password_field.on_submit = login
     reg_password_field.on_submit = register
