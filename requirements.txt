@@ -1,3 +1,4 @@
 openai
 python-dotenv
 flet
+flet-dropzone>=0.3.0

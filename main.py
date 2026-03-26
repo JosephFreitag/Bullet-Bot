@@ -2,17 +2,31 @@ import flet as ft
 import re
 import asyncio
 import json
+import mimetypes
 import os
 import queue
 import sys
 import threading
 from app.genai_service import GenAIService
 from app.database import DatabaseService, utc_date_string
+from app.multimodal import (
+    MAX_ATTACHMENTS,
+    PendingAttachment,
+    load_attachment_from_path,
+    storage_record,
+    user_bubble_widgets,
+)
 from app.openai_org_usage import (
     fetch_completions_tokens_today_utc,
     should_use_openai_org_usage,
 )
 from flet import Clipboard
+
+try:
+    from flet_dropzone import Dropzone, DropzoneEvent
+except ImportError:
+    Dropzone = None
+    DropzoneEvent = None
 
 DAILY_TOKEN_LIMIT = 1_000_000
 TOKEN_USAGE_POLL_SECONDS = 15
@@ -213,6 +227,119 @@ async def main(page: ft.Page):
     history_list = ft.ListView(expand=True, spacing=5, padding=5)
     chat_display = ft.ListView(expand=True, spacing=10, auto_scroll=True)
 
+    chat_panel_inner = ft.Container(
+        content=chat_display,
+        expand=True,
+        border=ft.Border.all(1, "#424242"),
+        border_radius=8,
+        padding=10,
+        bgcolor="#2d2d2d",
+    )
+
+    pending_attachments: list[PendingAttachment] = []
+
+    file_picker = ft.FilePicker()
+    page.overlay.append(file_picker)
+
+    attachment_chips = ft.Row(wrap=True, spacing=6, run_spacing=4)
+
+    async def remove_attachment_click(e):
+        idx = e.control.data
+        if isinstance(idx, int) and 0 <= idx < len(pending_attachments):
+            pending_attachments.pop(idx)
+            rebuild_attachment_chips()
+            page.update()
+
+    def rebuild_attachment_chips():
+        attachment_chips.controls.clear()
+        for i, att in enumerate(pending_attachments):
+            attachment_chips.controls.append(
+                ft.Container(
+                    padding=ft.Padding.symmetric(horizontal=8, vertical=4),
+                    bgcolor="#424242",
+                    border_radius=12,
+                    content=ft.Row(
+                        tight=True,
+                        spacing=4,
+                        controls=[
+                            ft.Text(att.name, size=11, color="#E0E0E0", max_lines=1),
+                            ft.IconButton(
+                                icon=ft.Icons.CLOSE,
+                                icon_size=14,
+                                icon_color="#9E9E9E",
+                                tooltip="Remove",
+                                data=i,
+                                on_click=remove_attachment_click,
+                            ),
+                        ],
+                    ),
+                )
+            )
+
+    async def add_attachments_from_paths(paths: list[str]):
+        for p in paths:
+            if not p:
+                continue
+            if len(pending_attachments) >= MAX_ATTACHMENTS:
+                page.snack_bar = ft.SnackBar(
+                    ft.Text(f"Maximum {MAX_ATTACHMENTS} attachments."),
+                    bgcolor="#c62828",
+                )
+                page.snack_bar.open = True
+                page.update()
+                return
+            att, err = load_attachment_from_path(p)
+            if err or att is None:
+                page.snack_bar = ft.SnackBar(
+                    ft.Text(f"Could not read file: {p} ({err})"),
+                    bgcolor="#c62828",
+                )
+                page.snack_bar.open = True
+                page.update()
+                continue
+            pending_attachments.append(att)
+        rebuild_attachment_chips()
+        page.update()
+
+    async def pick_files_click(e):
+        if not logged_in_user:
+            return
+        files = await file_picker.pick_files(
+            dialog_title="Attach files or images",
+            allow_multiple=True,
+            with_data=True,
+            file_type=ft.FilePickerFileType.ANY,
+        )
+        if not files:
+            return
+        for f in files:
+            if len(pending_attachments) >= MAX_ATTACHMENTS:
+                break
+            if f.bytes is not None:
+                mime, _ = mimetypes.guess_type(f.name)
+                pending_attachments.append(
+                    PendingAttachment(
+                        name=f.name,
+                        mime=mime or "application/octet-stream",
+                        data=f.bytes,
+                    )
+                )
+            elif f.path:
+                att, err = load_attachment_from_path(f.path)
+                if err or att is None:
+                    continue
+                pending_attachments.append(att)
+        rebuild_attachment_chips()
+        page.update()
+
+    attach_button = ft.IconButton(
+        icon=ft.Icons.ATTACH_FILE,
+        icon_color="#B0B0B0",
+        tooltip="Attach files",
+        visible=False,
+        on_click=pick_files_click,
+    )
+
     input_field = ft.TextField(
         multiline=True,
         min_lines=1,
@@ -264,6 +391,70 @@ async def main(page: ft.Page):
     settings_button_stack = ft.Stack(
         clip_behavior=ft.ClipBehavior.NONE,
         controls=[settings_button, fine_tune_indicator],
+    )
+
+    dzone_hint = ft.Row(
+        controls=[
+            ft.Icon(ft.Icons.CLOUD_UPLOAD_OUTLINED, size=18, color="#757575"),
+            ft.Text(
+                "Drop files or images here — Attach button, or Ctrl+Shift+V (clipboard image or files)",
+                size=11,
+                color="#757575",
+                expand=True,
+            ),
+        ],
+        spacing=8,
+    )
+    dzone_inner = ft.Container(
+        content=ft.Column(
+            [dzone_hint, attachment_chips],
+            spacing=6,
+            tight=True,
+        ),
+        padding=8,
+        bgcolor="#383838",
+        border=ft.border.all(1, "#555555"),
+        border_radius=6,
+    )
+
+    async def on_dropzone_dropped(e):
+        paths = getattr(e, "files", None) or []
+        if paths:
+            await add_attachments_from_paths(paths)
+
+    if Dropzone is not None:
+        file_drop_zone = Dropzone(
+            content=dzone_inner,
+            on_dropped=on_dropzone_dropped,
+        )
+    else:
+        file_drop_zone = dzone_inner
+
+    input_row = ft.Row(
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        controls=[
+            input_field,
+            attach_button,
+            context_dropdown,
+            settings_button_stack,
+            send_button,
+        ],
+    )
+
+    messages_column = ft.Column(
+        expand=True,
+        spacing=10,
+        controls=[
+            chat_panel_inner,
+            file_drop_zone,
+            ft.Container(
+                padding=ft.Padding(10, 0, 0, 0),
+                border=ft.Border.all(1, "#424242"),
+                border_radius=8,
+                bgcolor="#2d2d2d",
+                content=input_row,
+            ),
+        ],
     )
 
     def sync_fine_tune_badge():
@@ -423,6 +614,7 @@ async def main(page: ft.Page):
             logout_button.visible = True
             settings_button.visible = True
             settings_button_stack.visible = True
+            attach_button.visible = True
             sync_fine_tune_badge()
             schedule_token_usage_refresh()
             start_token_usage_polling()
@@ -488,6 +680,7 @@ async def main(page: ft.Page):
         logout_button.visible = False
         settings_button.visible = False
         settings_button_stack.visible = False
+        attach_button.visible = False
         
         page.appbar.title = ft.Text("Bullet Bot Login")
         page.update()
@@ -557,6 +750,8 @@ async def main(page: ft.Page):
 
         chat_display.controls.clear()
         input_field.value = ""
+        pending_attachments.clear()
+        rebuild_attachment_chips()
         for control in history_list.controls:
             control.bgcolor = None
             
@@ -576,7 +771,8 @@ async def main(page: ft.Page):
         genai_service.supplemental_context = supp_input.value # <--- Adds your manual rules
 
         user_input = input_field.value.strip()
-        if not logged_in_user or not user_input:
+        atts = list(pending_attachments)
+        if not logged_in_user or (not user_input and not atts):
             return
 
         await refresh_token_usage_async()
@@ -593,31 +789,51 @@ async def main(page: ft.Page):
             page.update()
             return
 
+        prior_history = db_service.get_messages(current_conversation_id) if current_conversation_id else []
+        v_err = genai_service.validate_user_turn(user_input, prior_history, atts)
+        if v_err:
+            page.snack_bar = ft.SnackBar(ft.Text(v_err), bgcolor="#c62828", duration=4000)
+            page.snack_bar.open = True
+            page.update()
+            return
+
         # --- UI State: Disable inputs while processing ---
         input_field.disabled = True
         send_button.disabled = True
-        send_button.icon_color = "#424242" 
+        send_button.icon_color = "#424242"
+        attach_button.disabled = True
         input_field.value = ""
+        pending_attachments.clear()
+        rebuild_attachment_chips()
         page.update()
 
         # --- Display User's Message ---
-        chat_display.controls.append(ft.Row(
-            controls=[
-                ft.Container(
-                    content=ft.Text("You", weight=ft.FontWeight.BOLD, color="#81d4fa"), 
-                    alignment=ft.Alignment.TOP_LEFT,
-                    width=80
-                ),
-                ft.Markdown(user_input, extension_set=ft.MarkdownExtensionSet.COMMON_MARK, code_theme="atom-one-dark", expand=True)
-            ],
-            spacing=10,
-            vertical_alignment=ft.CrossAxisAlignment.START,
-        ))
+        user_body = ft.Column(
+            spacing=6,
+            tight=True,
+            expand=True,
+            controls=user_bubble_widgets(storage_record(user_input, atts), ft),
+        )
+        chat_display.controls.append(
+            ft.Row(
+                controls=[
+                    ft.Container(
+                        content=ft.Text("You", weight=ft.FontWeight.BOLD, color="#81d4fa"),
+                        alignment=ft.Alignment.TOP_LEFT,
+                        width=80,
+                    ),
+                    user_body,
+                ],
+                spacing=10,
+                vertical_alignment=ft.CrossAxisAlignment.START,
+            )
+        )
 
         # --- Conversation row: create if needed, then stream with full prior history ---
         if current_conversation_id is None:
             ctx_label = context_dropdown.value or "Default"
-            title = f"[{ctx_label}] {user_input[:25]}"
+            title_seed = user_input.strip() or (atts[0].name if atts else "attachment")
+            title = f"[{ctx_label}] {title_seed[:25]}"
             current_conversation_id = db_service.create_conversation(logged_in_user['id'], title)
             await load_history_list()
 
@@ -651,9 +867,14 @@ async def main(page: ft.Page):
         def run_stream():
             try:
                 for fragment in genai_service.stream_ai_response(
-                    user_input, prior_history, usage_out=stream_usage
+                    user_input,
+                    prior_history,
+                    usage_out=stream_usage,
+                    attachments=atts,
                 ):
                     chunk_queue.put(("delta", fragment))
+            except ValueError as ex:
+                chunk_queue.put(("error", str(ex)))
             except Exception as ex:
                 chunk_queue.put(("error", str(ex)))
             finally:
@@ -688,7 +909,9 @@ async def main(page: ft.Page):
         bot_response = "".join(assembled).strip()
         if not bot_response:
             bot_response = "(No response)"
-        db_service.add_message(current_conversation_id, "user", user_input)
+        db_service.add_message(
+            current_conversation_id, "user", storage_record(user_input, atts)
+        )
         db_service.add_message(current_conversation_id, "assistant", bot_response)
 
         if stream_usage:
@@ -697,7 +920,9 @@ async def main(page: ft.Page):
                 u["total_tokens"], u["prompt_tokens"], u["completion_tokens"]
             )
         else:
-            est_in = genai_service.estimate_prompt_tokens(user_input, prior_history)
+            est_in = genai_service.estimate_prompt_tokens(
+                user_input, prior_history, atts
+            )
             est_out = max(1, len(bot_response) // 4)
             db_service.add_token_usage(est_in + est_out, est_in, est_out)
         await refresh_token_usage_async()
@@ -709,6 +934,7 @@ async def main(page: ft.Page):
         input_field.disabled = False
         send_button.disabled = False
         send_button.icon_color = "#B0B0B0" # Back to normal
+        attach_button.disabled = False
         
         # Final update and focus
         await input_field.focus()
@@ -752,20 +978,20 @@ async def main(page: ft.Page):
             is_user = msg["role"] == "user"
             
             if is_user:
-                # Create the standard display row for user messages.
+                ucol = ft.Column(
+                    spacing=6,
+                    tight=True,
+                    expand=True,
+                    controls=user_bubble_widgets(msg["content"], ft),
+                )
                 message_view = ft.Row(
                     controls=[
                         ft.Container(
                             content=ft.Text("You", weight=ft.FontWeight.BOLD, color="#81d4fa"),
                             alignment=ft.Alignment.TOP_LEFT,
-                            width=80
+                            width=80,
                         ),
-                        ft.Markdown(
-                            msg["content"],
-                            selectable=True,
-                            expand=True,
-                            extension_set=ft.MarkdownExtensionSet.GITHUB_WEB
-                        )
+                        ucol,
                     ],
                     vertical_alignment=ft.CrossAxisAlignment.START,
                 )
@@ -778,9 +1004,41 @@ async def main(page: ft.Page):
         page.update()
     
     async def on_keyboard(e: ft.KeyboardEvent):
-        """Handle Ctrl+Enter to send messages."""
+        """Ctrl+Enter send; Ctrl+Shift+V attach clipboard image or files (desktop)."""
         if e.ctrl and e.key == "Enter":
             await send_message_click(None)
+            return
+        if not logged_in_user or not (e.ctrl and e.shift):
+            return
+        key = (e.key or "").upper()
+        if key not in ("V",):
+            return
+        clip = ft.Clipboard()
+        try:
+            img = await clip.get_image()
+        except Exception:
+            img = None
+        if img:
+            if len(pending_attachments) >= MAX_ATTACHMENTS:
+                page.snack_bar = ft.SnackBar(
+                    ft.Text(f"Maximum {MAX_ATTACHMENTS} attachments."),
+                    bgcolor="#c62828",
+                )
+                page.snack_bar.open = True
+                page.update()
+                return
+            pending_attachments.append(
+                PendingAttachment(name="clipboard.png", mime="image/png", data=img)
+            )
+            rebuild_attachment_chips()
+            page.update()
+            return
+        try:
+            paths = await clip.get_files()
+        except Exception:
+            paths = []
+        if paths:
+            await add_attachments_from_paths(paths)
 
     async def delete_chat_click(e, conv_id):
         nonlocal current_conversation_id
@@ -854,35 +1112,7 @@ async def main(page: ft.Page):
                     new_chat_button,
                 ]),
             ),
-            ft.Column(
-                expand=True,
-                spacing=10,
-                controls=[
-                    ft.Container(
-                        content=chat_display,
-                        expand=True,
-                        border=ft.Border.all(1, "#424242"),
-                        border_radius=8,
-                        padding=10,
-                        bgcolor="#2d2d2d",
-                    ),
-                    ft.Container(
-                        padding=ft.Padding(10, 0, 0, 0),
-                        border=ft.Border.all(1, "#424242"),
-                        border_radius=8,
-                        bgcolor="#2d2d2d",
-                        content=ft.Row(
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                            controls=[
-                                input_field,
-                                context_dropdown,
-                                settings_button_stack,
-                                send_button,
-                            ],
-                        ),
-                    ),
-                ],
-            ),
+            messages_column,
         ]
     )
 
@@ -941,6 +1171,7 @@ async def main(page: ft.Page):
         logout_button.visible = True
         settings_button.visible = True
         settings_button_stack.visible = True
+        attach_button.visible = True
         sync_fine_tune_badge()
         page.appbar.title = ft.Text(f"Bullet Bot Ghost Writing For {user['username']}")
         schedule_token_usage_refresh()

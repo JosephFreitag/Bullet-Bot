@@ -29,7 +29,9 @@ hiddenimports = [
     "app",
     "app.database",
     "app.genai_service",
+    "app.multimodal",
     "app.openai_org_usage",
+    "flet_dropzone",
     "bcrypt",
     "_cffi_backend",
 ]
@@ -39,6 +41,14 @@ _flet_datas, _flet_binaries, _flet_hidden = collect_all("flet")
 datas += _flet_datas
 binaries += _flet_binaries
 hiddenimports += _flet_hidden
+
+try:
+    _fd_datas, _fd_binaries, _fd_hidden = collect_all("flet_dropzone")
+    datas += _fd_datas
+    binaries += _fd_binaries
+    hiddenimports += _fd_hidden
+except Exception:
+    pass
 
 a = Analysis(
     ["main.py"],

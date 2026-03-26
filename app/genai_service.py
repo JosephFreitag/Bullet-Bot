@@ -1,8 +1,16 @@
 import os
 import sys
+from typing import Any
+
 from openai import OpenAI
 from dotenv import load_dotenv
 from pathlib import Path
+
+from app.multimodal import (
+    PendingAttachment,
+    build_latest_user_content,
+    history_content_for_api,
+)
 
 load_dotenv()
 
@@ -116,9 +124,43 @@ class GenAIService:
             except Exception as e:
                 print(f"Error re-reading context file: {e}")
 
-    def _build_chat_messages(self, user_input, history=None):
-        if history is None:
-            history = []
+    @staticmethod
+    def _normalize_history_for_api(history: list[dict] | None) -> list[dict[str, Any]]:
+        if not history:
+            return []
+        out: list[dict[str, Any]] = []
+        for m in history:
+            if m.get("role") == "user":
+                raw = m.get("content", "")
+                out.append({"role": "user", "content": history_content_for_api(raw)})
+            else:
+                out.append({"role": m["role"], "content": m.get("content", "")})
+        return out
+
+    def instruction_prefix(self) -> str:
+        full_system_instructions = (self.system_prompt or "").strip()
+        if not full_system_instructions:
+            full_system_instructions = "You are a helpful assistant."
+        if self.supplemental_context.strip():
+            full_system_instructions += (
+                f"\n\nADDITIONAL USER RULES/CONTEXT:\n{self.supplemental_context.strip()}"
+            )
+        return (
+            "Follow ALL instructions below for your reply. They override any generic assistant behavior.\n\n"
+            "--- INSTRUCTIONS ---\n"
+            f"{full_system_instructions}\n"
+            "--- END INSTRUCTIONS ---\n\n"
+            "--- USER MESSAGE ---\n"
+        )
+
+    def _build_chat_messages(
+        self,
+        user_input: str,
+        history=None,
+        attachments: list[PendingAttachment] | None = None,
+    ):
+        history = history or []
+        attachments = attachments or []
 
         self._reload_active_context_from_disk()
 
@@ -130,24 +172,39 @@ class GenAIService:
                 f"\n\nADDITIONAL USER RULES/CONTEXT:\n{self.supplemental_context.strip()}"
             )
 
-        final_user_content = (
-            "Follow ALL instructions below for your reply. They override any generic assistant behavior.\n\n"
-            "--- INSTRUCTIONS ---\n"
-            f"{full_system_instructions}\n"
-            "--- END INSTRUCTIONS ---\n\n"
-            "--- USER MESSAGE ---\n"
-            f"{user_input}"
-        )
+        prefix = self.instruction_prefix()
+        last_content, err = build_latest_user_content(prefix, user_input, attachments)
+        if err:
+            raise ValueError(err)
 
-        messages = [{"role": "system", "content": full_system_instructions}]
-        messages.extend(history)
-        messages.append({"role": "user", "content": final_user_content})
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": full_system_instructions}
+        ]
+        messages.extend(self._normalize_history_for_api(history))
+        messages.append({"role": "user", "content": last_content})
         return messages
 
-    def estimate_prompt_tokens(self, user_input, history=None) -> int:
+    def estimate_prompt_tokens(
+        self, user_input, history=None, attachments: list[PendingAttachment] | None = None
+    ) -> int:
         """Rough token count for billing fallback (~4 chars per token)."""
-        messages = self._build_chat_messages(user_input, history)
-        chars = sum(len(m.get("content") or "") for m in messages)
+        try:
+            messages = self._build_chat_messages(user_input, history, attachments)
+        except ValueError:
+            messages = self._build_chat_messages("", history, [])
+        chars = 0
+        for m in messages:
+            c = m.get("content")
+            if isinstance(c, str):
+                chars += len(c)
+            elif isinstance(c, list):
+                for p in c:
+                    if not isinstance(p, dict):
+                        continue
+                    if p.get("type") == "text":
+                        chars += len(p.get("text") or "")
+                    else:
+                        chars += 8000
         return max(1, chars // 4)
 
     @staticmethod
@@ -164,8 +221,10 @@ class GenAIService:
         tot = int(total) if total is not None else pt + ct
         return {"total_tokens": tot, "prompt_tokens": pt, "completion_tokens": ct}
 
-    def get_ai_response(self, user_input, history=None):
-        messages = self._build_chat_messages(user_input, history)
+    def get_ai_response(
+        self, user_input, history=None, attachments: list[PendingAttachment] | None = None
+    ):
+        messages = self._build_chat_messages(user_input, history, attachments)
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -178,9 +237,20 @@ class GenAIService:
             print(f"\nAPI Error: {e}")
             return f"Sorry, I encountered an error: {e}", None
 
-    def stream_ai_response(self, user_input, history=None, usage_out: list | None = None):
+    def stream_ai_response(
+        self,
+        user_input,
+        history=None,
+        usage_out: list | None = None,
+        attachments: list[PendingAttachment] | None = None,
+    ):
         """Yields text fragments; optional usage_out list receives one usage dict if the API reports it."""
-        messages = self._build_chat_messages(user_input, history)
+        try:
+            messages = self._build_chat_messages(user_input, history, attachments)
+        except ValueError as e:
+            yield str(e)
+            return
+
         last_usage = None
         try:
             try:
@@ -212,3 +282,13 @@ class GenAIService:
         finally:
             if usage_out is not None and last_usage is not None:
                 usage_out.append(last_usage)
+
+    def validate_user_turn(
+        self, user_input: str, history=None, attachments: list[PendingAttachment] | None = None
+    ) -> str | None:
+        """Return error string if the turn cannot be built, else None."""
+        try:
+            self._build_chat_messages(user_input, history, attachments)
+        except ValueError as e:
+            return str(e)
+        return None
