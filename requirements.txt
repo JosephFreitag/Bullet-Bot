@@ -1,4 +1,4 @@
 openai
 python-dotenv
 flet
-flet-dropzone>=0.3.0
+# Optional native drag-and-drop (needs matching Flet client build): pip install flet-dropzone

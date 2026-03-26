@@ -22,11 +22,19 @@ from app.openai_org_usage import (
 )
 from flet import Clipboard
 
-try:
-    from flet_dropzone import Dropzone, DropzoneEvent
-except ImportError:
-    Dropzone = None
-    DropzoneEvent = None
+# flet-dropzone: native plugin; stock Flet/PyInstaller client → "Unknown control: flet_dropzone".
+# Use Attach + Ctrl+Shift+V by default; set BULLET_BOT_DROPZONE=1 after `flet build` with the plugin.
+USE_FLET_DROPZONE = os.environ.get("BULLET_BOT_DROPZONE", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+Dropzone = None
+if USE_FLET_DROPZONE:
+    try:
+        from flet_dropzone import Dropzone
+    except ImportError:
+        Dropzone = None
 
 DAILY_TOKEN_LIMIT = 1_000_000
 TOKEN_USAGE_POLL_SECONDS = 15
@@ -238,8 +246,8 @@ async def main(page: ft.Page):
 
     pending_attachments: list[PendingAttachment] = []
 
+    # FilePicker is a Service (auto-registers with the page). Never put it in page.overlay.
     file_picker = ft.FilePicker()
-    page.overlay.append(file_picker)
 
     attachment_chips = ft.Row(wrap=True, spacing=6, run_spacing=4)
 
@@ -397,7 +405,12 @@ async def main(page: ft.Page):
         controls=[
             ft.Icon(ft.Icons.CLOUD_UPLOAD_OUTLINED, size=18, color="#757575"),
             ft.Text(
-                "Drop files or images here — Attach button, or Ctrl+Shift+V (clipboard image or files)",
+                (
+                    "Drag & drop works when BULLET_BOT_DROPZONE=1 and the app is built with "
+                    "flet-dropzone (see README). Otherwise: Attach button or Ctrl+Shift+V."
+                )
+                if Dropzone is None
+                else "Drop files or images here — also Attach or Ctrl+Shift+V",
                 size=11,
                 color="#757575",
                 expand=True,
@@ -413,7 +426,7 @@ async def main(page: ft.Page):
         ),
         padding=8,
         bgcolor="#383838",
-        border=ft.border.all(1, "#555555"),
+        border=ft.Border.all(1, "#555555"),
         border_radius=6,
     )
 
