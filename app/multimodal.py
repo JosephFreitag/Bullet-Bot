@@ -13,7 +13,7 @@ from typing import Any
 
 MARKER = "_bb_mm"
 MAX_ATTACHMENTS = 12
-MAX_IMAGE_BYTES = 15 * 1024 * 1024
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_TEXT_FILE_BYTES = 512 * 1024
 
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -106,19 +106,28 @@ def build_latest_user_content(
     attachments: list[PendingAttachment],
 ) -> tuple[str | list[dict[str, Any]], str | None]:
     """
-    Final user message for the current turn. instruction_prefix ends with --- USER MESSAGE ---\\n
+    Final user message for the current turn.
+
+    Text-only: single string repeats instruction_prefix + user (legacy behavior for plain chat).
+
+    With attachments: multipart list. Do NOT embed instruction_prefix here — the system
+    message already carries full instructions; duplicating them plus base64 images often
+    exceeds gateway limits and returns 502 upstream_error on OpenAI-compat / Gemini proxies.
     """
     body = user_text.strip()
     if not attachments:
         return instruction_prefix + body, None
     if not body:
         body = "(See attached files/images.)"
-    core = instruction_prefix + body
-    parts: list[dict[str, Any]] = [{"type": "text", "text": core}]
+    text = (
+        "Use the system instructions and preloaded context from earlier in this request.\n\n"
+        f"{body}"
+    )
+    parts: list[dict[str, Any]] = [{"type": "text", "text": text}]
     for att in attachments:
         extra, err = normalize_attachment(att)
         if err:
-            return core, err
+            return text, err
         parts.extend(extra)
     return parts, None
 
