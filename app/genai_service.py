@@ -252,6 +252,20 @@ class GenAIService:
             return
 
         last_usage = None
+
+        def _yield_stream(stream_iter):
+            nonlocal last_usage
+            for chunk in stream_iter:
+                u = getattr(chunk, "usage", None)
+                parsed = self._usage_dict_from_api(u)
+                if parsed:
+                    last_usage = parsed
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    yield delta.content
+
         try:
             try:
                 stream = self.client.chat.completions.create(
@@ -266,21 +280,38 @@ class GenAIService:
                     messages=messages,
                     stream=True,
                 )
-            for chunk in stream:
-                u = getattr(chunk, "usage", None)
-                parsed = self._usage_dict_from_api(u)
-                if parsed:
-                    last_usage = parsed
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-                if delta and delta.content:
-                    yield delta.content
+            yield from _yield_stream(stream)
         except Exception as e:
+            err_s = str(e).lower()
+            retryable = any(
+                x in err_s for x in ("502", "503", "504", "upstream", "timeout", "gateway")
+            )
+            if retryable:
+                try:
+                    resp = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        stream=False,
+                    )
+                    u = self._usage_dict_from_api(getattr(resp, "usage", None))
+                    if u and usage_out is not None:
+                        usage_out.append(u)
+                    text = resp.choices[0].message.content or ""
+                    if text:
+                        yield text
+                    return
+                except Exception as e2:
+                    print(f"\nAPI Error (retry): {e2}")
+                    yield f"Sorry, I encountered an error: {e2}"
+                    return
             print(f"\nAPI Error: {e}")
             yield f"Sorry, I encountered an error: {e}"
         finally:
-            if usage_out is not None and last_usage is not None:
+            if (
+                usage_out is not None
+                and last_usage is not None
+                and len(usage_out) == 0
+            ):
                 usage_out.append(last_usage)
 
     def validate_user_turn(

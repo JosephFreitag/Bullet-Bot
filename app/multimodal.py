@@ -42,6 +42,40 @@ def load_attachment_from_path(path: str) -> PendingAttachment | tuple[None, str]
     return PendingAttachment(name=name, mime=_guess_mime(path), data=data), ""
 
 
+def attachments_include_image(attachments: list[PendingAttachment]) -> bool:
+    for att in attachments:
+        ext = os.path.splitext(att.name)[1].lower()
+        if ext in IMAGE_EXT or (att.mime or "").lower().startswith("image/"):
+            return True
+    return False
+
+
+def text_payload_for_attachment(att: PendingAttachment) -> tuple[str | None, str | None]:
+    """Plain text to inline in a string user message; None if this is a binary image."""
+    ext = os.path.splitext(att.name)[1].lower()
+    lower_mime = (att.mime or "").lower()
+    if ext in IMAGE_EXT or lower_mime.startswith("image/"):
+        return None, None
+    if ext in TEXT_EXT or lower_mime.startswith("text/"):
+        if len(att.data) > MAX_TEXT_FILE_BYTES:
+            return None, f"{att.name}: text file too large (max {MAX_TEXT_FILE_BYTES // 1024} KB)"
+        try:
+            text = att.data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            return None, f"{att.name}: not valid UTF-8 text"
+        snippet = text[:120_000]
+        if len(text) > 120_000:
+            snippet += "\n\n[... truncated ...]"
+        return snippet, None
+    try:
+        text = att.data.decode("utf-8-sig")
+        if len(text) > MAX_TEXT_FILE_BYTES:
+            return None, f"{att.name}: file too large as text"
+        return text, None
+    except UnicodeDecodeError:
+        return None, f"{att.name}: unsupported type (use text or image)"
+
+
 def normalize_attachment(att: PendingAttachment) -> tuple[list[dict[str, Any]], str | None]:
     """
     Returns OpenAI content parts (excluding the main instruction+text part) and optional error.
@@ -86,11 +120,24 @@ def build_historical_user_content(
 ) -> tuple[str | list[dict[str, Any]], str | None]:
     """
     Content for a past user turn (no instruction wrapper).
-    Returns (content, error_message).
+
+    Many OpenAI-compatible gateways reject user messages where content is a list unless
+    they implement vision; use a single string when there are no images.
     """
     if not attachments:
         return user_text, None
     body = user_text.strip() if user_text.strip() else "(See attached files/images.)"
+
+    if not attachments_include_image(attachments):
+        combined = body
+        for att in attachments:
+            t, err = text_payload_for_attachment(att)
+            if err:
+                return combined, err
+            if t is not None:
+                combined += f"\n\n--- Attached file: {att.name} ---\n{t}"
+        return combined, None
+
     parts: list[dict[str, Any]] = [{"type": "text", "text": body}]
     for att in attachments:
         extra, err = normalize_attachment(att)
@@ -108,26 +155,45 @@ def build_latest_user_content(
     """
     Final user message for the current turn.
 
-    Text-only: single string repeats instruction_prefix + user (legacy behavior for plain chat).
-
-    With attachments: multipart list. Do NOT embed instruction_prefix here — the system
-    message already carries full instructions; duplicating them plus base64 images often
-    exceeds gateway limits and returns 502 upstream_error on OpenAI-compat / Gemini proxies.
+    Text-only attachments: one string (same as plain chat) so proxies accept the request.
+    With images: multipart list; instruction_prefix is not duplicated (system has it).
     """
     body = user_text.strip()
     if not attachments:
         return instruction_prefix + body, None
     if not body:
         body = "(See attached files/images.)"
-    text = (
+
+    if not attachments_include_image(attachments):
+        combined = instruction_prefix + body
+        for att in attachments:
+            t, err = text_payload_for_attachment(att)
+            if err:
+                return combined, err
+            if t is not None:
+                combined += f"\n\n--- Attached file: {att.name} ---\n{t}"
+        return combined, None
+
+    # Images present: short user text + image parts (inline any non-image files into text)
+    text_chunks = [
         "Use the system instructions and preloaded context from earlier in this request.\n\n"
-        f"{body}"
-    )
-    parts: list[dict[str, Any]] = [{"type": "text", "text": text}]
+        + body
+    ]
     for att in attachments:
+        t, err = text_payload_for_attachment(att)
+        if err:
+            return "\n".join(text_chunks), err
+        if t is not None:
+            text_chunks.append(f"\n\n--- Attached file: {att.name} ---\n{t}")
+    text_blob = "".join(text_chunks)
+    parts: list[dict[str, Any]] = [{"type": "text", "text": text_blob}]
+    for att in attachments:
+        ext = os.path.splitext(att.name)[1].lower()
+        if ext not in IMAGE_EXT and not (att.mime or "").lower().startswith("image/"):
+            continue
         extra, err = normalize_attachment(att)
         if err:
-            return text, err
+            return text_blob, err
         parts.extend(extra)
     return parts, None
 
